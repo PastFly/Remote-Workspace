@@ -1,2 +1,9 @@
-# Remote-Workspace
-Official release downloads for Remote Workspace on Windows x64
+# Remote Workspace
+
+Remote Workspace — менеджер подключений для Windows x64. Он поддерживает вложенные папки, импорт каталога mRemoteNG из SQL Server и подключение RDP через системный клиент Windows во вкладках.
+
+[Скачать последний выпуск](https://github.com/PastFly/Remote-Workspace/releases/latest)
+
+Для первой установки скачайте файл `Remote-Workspace-<версия>-x64.msi`. Начиная с 0.7.8, приложение проверяет обновления в этом репозитории по умолчанию. Загруженный пакет устанавливается при закрытии приложения. Windows может запросить подтверждение администратора.
+
+Каждый выпуск содержит MSI и файл `.msi.sig` с отдельной подписью SHA-256/RSA-3072. Приложение проверяет подпись по включённому в сборку открытому ключу. Ключ также доступен в файле `release-signing-public.pem`.
