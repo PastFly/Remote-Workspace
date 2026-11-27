@@ -76,25 +76,87 @@ PY
     sudo -n install -m 0755 "$work_dir/marker.py" /usr/local/bin/rw-rdp-marker
     sudo -n install -o rdplab -m 0600 /dev/null /var/log/rw-lab-display
     printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/rw-rdp-marker' | sudo -n tee /etc/xrdp/startwm.sh >/dev/null
+    # Noble's xrdp 0.9.24 has a dedicated IPv4 loopback syntax.
     sudo -n sed -i \
-        -e 's|^port=3389$|port=tcp://127.0.0.1:33890|' \
+        -e 's|^port=3389$|port=tcp://.:33890|' \
         -e 's/^security_layer=.*/security_layer=tls/' \
         -e 's/^autorun=.*/autorun=Xorg/' \
         -e 's|^certificate=.*|certificate=/etc/xrdp/rw-lab.pem|' \
         -e 's|^key_file=.*|key_file=/etc/xrdp/rw-lab.key|' \
         /etc/xrdp/xrdp.ini
-    sudo -n grep -qx 'port=tcp://127.0.0.1:33890' /etc/xrdp/xrdp.ini
+    if ! sudo -n awk '
+        /^\[/ { globals = ($0 == "[Globals]") }
+        globals && /^[[:space:]]*port[[:space:]]*=/ {
+            count++
+            if ($0 == "port=tcp://.:33890") loopback++
+        }
+        END { exit !(count == 1 && loopback == 1) }
+    ' /etc/xrdp/xrdp.ini; then
+        echo 'The xrdp configuration does not specify exactly one IPv4 loopback listener.' >&2
+        return 1
+    fi
 
     sudo -n systemctl unmask --runtime xrdp.service xrdp-sesman.service
-    sudo -n systemctl start xrdp.service
-    local sockets
-    sockets=$(ss -H -lnt 'sport = :3389 or sport = :33890' | awk '{print $4}')
-    if [[ $sockets != 127.0.0.1:33890 ]]; then
-        sudo -n systemctl stop xrdp.service xrdp-sesman.service
-        echo 'The xrdp fixture did not bind exclusively to 127.0.0.1:33890.' >&2
+    if ! sudo -n systemctl start xrdp-sesman.service xrdp.service; then
+        stop_host_xrdp
+        diagnose_host_xrdp 'service start failed'
+        return 1
+    fi
+    if ! wait_host_xrdp; then
         return 1
     fi
     echo 'Private xrdp fixture listening exclusively on the Linux host loopback.'
+}
+
+wait_host_xrdp() {
+    local attempt sockets loopback unexpected
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        if ! sockets=$(ss -H -lnt 'sport = :3389 or sport = :33890' | awk '
+            NF >= 4 && $(NF-1) == "127.0.0.1:33890" { loopback++; next }
+            NF { unexpected++ }
+            END { print loopback + 0, unexpected + 0 }
+        '); then
+            stop_host_xrdp
+            diagnose_host_xrdp 'socket inspection failed'
+            return 1
+        fi
+        read -r loopback unexpected <<< "$sockets"
+        if ((unexpected > 0 || loopback > 1)); then
+            stop_host_xrdp
+            diagnose_host_xrdp "unexpected socket counts: loopback=$loopback unexpected=$unexpected"
+            return 1
+        fi
+        if ((loopback == 1)) && systemctl is-active --quiet xrdp.service && systemctl is-active --quiet xrdp-sesman.service; then
+            return 0
+        fi
+        sleep 1
+    done
+    stop_host_xrdp
+    diagnose_host_xrdp "listen readiness timed out: loopback=$loopback unexpected=$unexpected"
+    return 1
+}
+
+diagnose_host_xrdp() {
+    printf 'The private xrdp listener was stopped (%s).\n' "$1" >&2
+    dpkg-query -W -f 'xrdp package: ${Version}\n' xrdp >&2 || true
+    for unit in xrdp.service xrdp-sesman.service; do
+        systemctl show "$unit" --property=Id --property=ActiveState --property=SubState \
+            --property=Result --property=ExecMainStatus >&2 || true
+    done
+    {
+        sudo -n journalctl -u xrdp.service -u xrdp-sesman.service -n 50 --no-pager -o cat 2>/dev/null
+        sudo -n tail -n 40 /var/log/xrdp.log /var/log/xrdp-sesman.log 2>/dev/null
+    } | awk '
+        {
+            line = tolower($0)
+            if (line ~ /address already in use|could not bind|failed to bind|listen error/) bind_errors++
+            if (line ~ /permission denied|not readable/) permission_errors++
+            if (line ~ /failed to start|startup failed|listen_main_loop failed/) startup_errors++
+        }
+        END {
+            printf "Recent xrdp diagnostics: bind_errors=%d permission_errors=%d startup_errors=%d\n", bind_errors, permission_errors, startup_errors
+        }
+    ' >&2 || true
 }
 
 stop_host_xrdp() {
