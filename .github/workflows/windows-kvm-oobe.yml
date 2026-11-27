@@ -1,0 +1,21 @@
+name: Disposable Windows first logon and virtual card
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-085-windows-kvm-oobe-*'
+permissions:
+  contents: read
+jobs:
+  logon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RW_LAB_STAGE_PANTHER_ANSWER: 'true'
+      RW_LAB_TEST_VIRTUAL_CARD: 'true'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify Windows Explorer, TPM and temporary smart card in a network-disabled guest
+        shell: bash
+        run: bash qa/windows-kvm/run-windows-kvm-oobe.sh
