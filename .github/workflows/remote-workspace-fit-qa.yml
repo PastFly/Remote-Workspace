@@ -1,0 +1,38 @@
+name: Windows VM lab capacity
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-085-windows-vm-preflight-*'
+permissions:
+  contents: read
+jobs:
+  kvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Check x64 acceleration and disk
+        run: |
+          uname -m
+          df -h "$RUNNER_TEMP"
+          free -h
+          python3 - <<'PY'
+          import os
+          import fcntl
+          try:
+              fd = os.open('/dev/kvm', os.O_RDWR)
+          except OSError as err:
+              print('KVM=' + str(err))
+          else:
+              with os.fdopen(fd, 'rb', buffering=0) as handle:
+                  print(f'KVM_API_VERSION={fcntl.ioctl(handle, 0xAE00)}')
+          PY
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 4
+    steps:
+      - name: Check available Windows TPM and virtualization
+        shell: powershell
+        run: |
+          Get-Tpm | Select-Object TpmPresent,TpmReady | Format-List
+          Get-CimInstance Win32_Processor | Select-Object VMMonitorModeExtensions, VirtualizationFirmwareEnabled | Format-List
+          Get-Volume -DriveLetter ($env:RUNNER_TEMP.Substring(0, 1)) | Select-Object DriveLetter,SizeRemaining | Format-List
