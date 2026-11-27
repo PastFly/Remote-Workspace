@@ -14,7 +14,10 @@ REPORT_FIELDS = {
     "RWLAB_TPM": ("getTpmAvailable", "tpmPresent", "tpmReady", "tpmManufacturer", "secureBoot", "virtualCardTool"),
     "RWLAB_CARD": (
         "attempted", "createdState", "readerVisible", "createExitCode", "destroyExitCode",
-        "removed", "newPnpCount", "pcscCountBefore", "pcscCountAfterCreate", "pcscCountAfterDestroy",
+        "removed", "newPnpCount", "pnpCountBefore", "pcscBaselineUnknown",
+        "pcscCountBefore", "pcscCountAfterCreate", "pcscCountAfterDestroy",
+        "pcscBeforeHResult", "pcscAfterCreateHResult", "pcscAfterDestroyHResult",
+        "serviceStatusBefore", "serviceStatusAfterCreate", "serviceStatusAfterDestroy",
     ),
     "RWLAB_FIT_RESULT": ("passed", "version", "scope", "growth", "candidateTested", "smartCardTested", "phase"),
     "RWLAB_COMPLETE": ("virtualCardRequested", "fitRequested"),
@@ -23,6 +26,39 @@ REPORT_FIELDS = {
 
 FIT_STAGES = ("Initial", "Growth", "Shrink")
 FIT_GEOMETRY = {"viewport": 2, "stage": 2, "frame": 4}
+PCSC_SUCCESS = "0x00000000"
+PCSC_NO_SERVICE = "0x8010001D"
+PCSC_KNOWN_COUNTS = {PCSC_SUCCESS, "0x8010002E"}
+
+
+def card_lifecycle_confirmed(card):
+    if (
+        card.get("readerVisible") is not True or card.get("removed") is not True
+        or card.get("createExitCode") != 0 or card.get("destroyExitCode") != 0
+        or card.get("newPnpCount") != 1 or card.get("pcscAfterCreateHResult") != PCSC_SUCCESS
+    ):
+        return False
+    before = card.get("pcscCountBefore")
+    after_create = card.get("pcscCountAfterCreate")
+    after_destroy = card.get("pcscCountAfterDestroy")
+    after_destroy_status = card.get("pcscAfterDestroyHResult")
+    if type(after_create) is not int:
+        return False
+    if card.get("pcscBaselineUnknown") is True:
+        return (
+            before is None and card.get("pcscBeforeHResult") == PCSC_NO_SERVICE
+            and card.get("pnpCountBefore") == 0 and after_create == 1
+            and (
+                (after_destroy is None and after_destroy_status == PCSC_NO_SERVICE)
+                or (type(after_destroy) is int and after_destroy == 0 and after_destroy_status in PCSC_KNOWN_COUNTS)
+            )
+        )
+    return (
+        card.get("pcscBeforeHResult") in PCSC_KNOWN_COUNTS
+        and type(before) is int and type(after_destroy) is int and before >= 0
+        and after_create == before + 1 and after_destroy == before
+        and after_destroy_status in PCSC_KNOWN_COUNTS
+    )
 
 
 def read_fit_measurements(report):
@@ -104,16 +140,8 @@ def observe(serial, monitor, screenshot):
     tpm = observed.get("RWLAB_TPM", {})
     if not (tpm.get("tpmPresent") and tpm.get("tpmReady")):
         raise RuntimeError("Windows did not report a present and ready TPM")
-    if observed["RWLAB_COMPLETE"].get("virtualCardRequested"):
-        card = observed.get("RWLAB_CARD", {})
-        counts = tuple(card.get(key) for key in ("pcscCountBefore", "pcscCountAfterCreate", "pcscCountAfterDestroy"))
-        if (
-            card.get("readerVisible") is not True or card.get("removed") is not True
-            or card.get("createExitCode") != 0 or card.get("destroyExitCode") != 0
-            or card.get("newPnpCount") != 1 or any(type(count) is not int for count in counts)
-            or counts[1] != counts[0] + 1 or counts[2] != counts[0]
-        ):
-            raise RuntimeError("Windows did not confirm both creation and removal of the disposable virtual reader")
+    if observed["RWLAB_COMPLETE"].get("virtualCardRequested") and not card_lifecycle_confirmed(observed.get("RWLAB_CARD", {})):
+        raise RuntimeError("Windows did not confirm both creation and removal of the disposable virtual reader")
     if observed["RWLAB_COMPLETE"].get("fitRequested") or "RWLAB_FIT_RESULT" in observed:
         fit = observed.get("RWLAB_FIT_RESULT", {})
         if fit.get("passed") is not True or fit.get("version") != "0.8.4.0" or len(fit["measurements"]) != len(FIT_STAGES):
