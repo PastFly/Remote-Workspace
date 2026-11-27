@@ -1,0 +1,33 @@
+name: Remote Workspace Windows QA
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-082-windows-*'
+permissions:
+  contents: read
+jobs:
+  installed-preview-worker:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: Test the installed Preview updater
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REPOSITORY -ne 'PastFly/Remote-Workspace') {
+            throw 'Run this fixture only on the disposable repository runner.'
+          }
+          $lab = Join-Path $env:RUNNER_TEMP 'remote-workspace-qa'
+          New-Item -Path $lab -ItemType Directory | Out-Null
+          $encoded = gh api "repos/$env:GITHUB_REPOSITORY/contents/.github/qa/Test-InstalledPreviewWorker.ps1?ref=$env:GITHUB_SHA" --jq .content
+          if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve the test fixture.' }
+          $script = Join-Path $lab 'Test-InstalledPreviewWorker.ps1'
+          [IO.File]::WriteAllBytes($script, [Convert]::FromBase64String(($encoded -join '')))
+          foreach ($version in @('0.8.0','0.8.1')) {
+            gh release download "v$version" --repo $env:GITHUB_REPOSITORY --pattern "Remote-Workspace-$version-x64.msi*" --dir $lab
+            if ($LASTEXITCODE -ne 0) { throw "Could not download published package $version." }
+          }
+          Write-Host "SESSION_INTERACTIVE=$([Environment]::UserInteractive) SESSION_ID=$((Get-Process -Id $PID).SessionId)"
+          & $script -DisposableLab -BaselineMsi (Join-Path $lab 'Remote-Workspace-0.8.0-x64.msi') -BaselineVersion '0.8.0' -TargetMsi (Join-Path $lab 'Remote-Workspace-0.8.1-x64.msi') -TargetSignature (Join-Path $lab 'Remote-Workspace-0.8.1-x64.msi.sig') -TargetVersion '0.8.1' -BaselineSha256 '6a702b194c4df22807c2075f63bdaa4852d9e7d958205f92dac804468aef2a5b' -TargetSha256 '95d593ad416c1212e2cced8f64fcc62240b6dbddbd3f3b351aab2704e4b4ce47'
