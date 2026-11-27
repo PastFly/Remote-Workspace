@@ -34,13 +34,140 @@ function Invoke-LabCardCommand([string] $CardTool, [string] $Arguments) {
         $errorOutput = $command.StandardError.ReadToEndAsync()
         if (-not $command.WaitForExit(60000)) {
             $command.Kill()
-            return @{ exitCode = -1; output = '' }
+            $null = $command.WaitForExit(3000)
+            return -1
         }
+        $null = $output.GetAwaiter().GetResult()
         $null = $errorOutput.GetAwaiter().GetResult()
-        return @{ exitCode = $command.ExitCode; output = $output.GetAwaiter().GetResult() }
+        return $command.ExitCode
     }
     finally {
         $command.Dispose()
+    }
+}
+
+function Get-LabReaderState {
+    $readerIds = @(
+        Get-PnpDevice -Class SmartCardReader -PresentOnly -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty InstanceId
+    )
+    $pcscReaders = $null
+    try { $pcscReaders = @([RwLabPcsc]::ListReaders()) } catch {}
+    return [pscustomobject] @{ readerIds = $readerIds; pcscReaders = $pcscReaders }
+}
+
+function Test-LabVirtualReader([string] $CardTool) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class RwLabPcsc
+{
+    private const uint SystemScope = 2;
+    private const int NoReaders = unchecked((int)0x8010002E);
+
+    [DllImport("winscard.dll", ExactSpelling = true)]
+    private static extern int SCardEstablishContext(uint scope, IntPtr reserved1,
+                                                      IntPtr reserved2, out IntPtr context);
+
+    [DllImport("winscard.dll", ExactSpelling = true)]
+    private static extern int SCardReleaseContext(IntPtr context);
+
+    [DllImport("winscard.dll", ExactSpelling = true)]
+    private static extern int SCardListReadersW(IntPtr context, IntPtr groups,
+                                                IntPtr readers, ref uint characters);
+
+    public static string[] ListReaders()
+    {
+        IntPtr context;
+        Check(SCardEstablishContext(SystemScope, IntPtr.Zero, IntPtr.Zero, out context));
+        try
+        {
+            uint characters = 0;
+            int status = SCardListReadersW(context, IntPtr.Zero, IntPtr.Zero, ref characters);
+            if (status == NoReaders) return new string[0];
+            Check(status);
+            if (characters == 0) return new string[0];
+
+            IntPtr buffer = Marshal.AllocHGlobal(checked((int)characters * sizeof(char)));
+            try
+            {
+                status = SCardListReadersW(context, IntPtr.Zero, buffer, ref characters);
+                if (status == NoReaders) return new string[0];
+                Check(status);
+                return Marshal.PtrToStringUni(buffer, checked((int)characters))
+                    .Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+        finally { SCardReleaseContext(context); }
+    }
+
+    private static void Check(int result)
+    {
+        if (result != 0) throw new InvalidOperationException("Windows smart-card reader enumeration failed.");
+    }
+}
+'@
+
+    Start-Service -Name SCardSvr -ErrorAction SilentlyContinue
+    $before = Get-LabReaderState
+    if ($null -eq $before.pcscReaders) {
+        return @{ attempted = $false; createdState = 'pcsc-unavailable'; readerVisible = $false; removed = $false }
+    }
+
+    # The documented default PIN is used only for this empty, disposable card.
+    $creationExitCode = Invoke-LabCardCommand $CardTool 'create /name RWLAB-TemporaryCard /adminkey RANDOM /pin DEFAULT /generate'
+    $visible = $false
+    $removed = $false
+    $destroyExitCode = $null
+    $afterRemoval = $null
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        $afterCreation = Get-LabReaderState
+        $newIds = @($afterCreation.readerIds | Where-Object { $before.readerIds -notcontains $_ })
+        $newPcsc = @($afterCreation.pcscReaders | Where-Object { $null -ne $_ -and $before.pcscReaders -notcontains $_ })
+        if ($newIds.Count -eq 1 -and $newPcsc.Count -eq 1) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    $verifiedId = $null
+    if ($newIds.Count -eq 1 -and $newIds[0] -match '^ROOT\\SMARTCARDREADER\\[A-F0-9]{4}$') {
+        $verifiedId = $newIds[0]
+    }
+    $visible = $creationExitCode -eq 0 -and $null -ne $verifiedId -and $newPcsc.Count -eq 1 -and
+        $afterCreation.pcscReaders.Count -eq ($before.pcscReaders.Count + 1)
+
+    # Use only the new exact PnP instance, never a device ID parsed from command output.
+    if ($null -ne $verifiedId) {
+        $destroyExitCode = Invoke-LabCardCommand $CardTool ('destroy /instance ' + $verifiedId)
+        $deadline = (Get-Date).AddSeconds(20)
+        do {
+            $afterRemoval = Get-LabReaderState
+            $matchingReaders = $null -ne $afterRemoval.pcscReaders -and
+                $afterRemoval.pcscReaders.Count -eq $before.pcscReaders.Count -and
+                @($afterRemoval.pcscReaders | Where-Object { $before.pcscReaders -notcontains $_ }).Count -eq 0
+            $removed = $destroyExitCode -eq 0 -and $matchingReaders -and $afterRemoval.readerIds -notcontains $verifiedId
+            if ($removed) { break }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+    }
+
+    $createdState = if ($visible) { 'observed' }
+        elseif ($creationExitCode -ne 0) { 'create-failed' }
+        elseif ($null -eq $verifiedId) { 'new-pnp-instance-unverified' }
+        else { 'new-pcsc-reader-unverified' }
+    return @{
+        attempted = $true
+        createdState = $createdState
+        readerVisible = $visible
+        createExitCode = $creationExitCode
+        destroyExitCode = $destroyExitCode
+        removed = $removed
+        newPnpCount = $newIds.Count
+        pcscCountBefore = $before.pcscReaders.Count
+        pcscCountAfterCreate = if ($null -ne $afterCreation.pcscReaders) { $afterCreation.pcscReaders.Count } else { $null }
+        pcscCountAfterDestroy = if ($null -ne $afterRemoval -and $null -ne $afterRemoval.pcscReaders) { $afterRemoval.pcscReaders.Count } else { $null }
     }
 }
 
@@ -97,43 +224,19 @@ try {
     if ($attemptCard) {
         $activeAdapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object Status -eq 'Up')
         if ($activeAdapters.Count -ne 0 -or -not ($tpm -and $tpm.TpmReady) -or -not $cardToolPresent) {
-            & $report 'RWLAB_CARD' @{ attempted = $false; readerVisible = $false; removed = $false }
+            & $report 'RWLAB_CARD' @{ attempted = $false; createdState = 'precondition-unmet'; readerVisible = $false; removed = $false }
         }
         else {
-            # The documented default PIN is only used for this empty, disposable card.
-            # No certificate, private-key enrollment or network logon occurs in this probe.
-            $created = Invoke-LabCardCommand $cardTool 'create /name RWLAB-TemporaryCard /adminkey RANDOM /pin DEFAULT /generate'
-            $instance = [regex]::Match($created.output, 'ROOT\\SMARTCARDREADER\\[0-9A-F]+', 'IgnoreCase')
-            $visible = $false
-            $removed = $false
-            if ($instance.Success) {
-                try {
-                    $deadline = (Get-Date).AddSeconds(10)
-                    do {
-                        $visible = $null -ne (Get-PnpDevice -InstanceId $instance.Value -PresentOnly -ErrorAction SilentlyContinue)
-                        if ($visible) { break }
-                        Start-Sleep -Milliseconds 500
-                    } while ((Get-Date) -lt $deadline)
-                }
-                finally {
-                    $deleted = Invoke-LabCardCommand $cardTool ('destroy /instance ' + $instance.Value)
-                    $removed = $deleted.exitCode -eq 0
-                }
-            }
-            & $report 'RWLAB_CARD' @{
-                attempted = $true
-                readerVisible = $visible
-                createExitCode = $created.exitCode
-                removed = $removed
-            }
+            & $report 'RWLAB_CARD' (Test-LabVirtualReader $cardTool)
         }
     }
 
     $additional = Join-Path $PSScriptRoot 'Run-RemoteWorkspaceFixture.ps1'
-    if (Test-Path -LiteralPath $additional) {
+    $fitRequested = Test-Path -LiteralPath $additional
+    if ($fitRequested) {
         & $additional -MediaRoot $PSScriptRoot -Report $report *> $null
     }
-    & $report 'RWLAB_COMPLETE' @{ virtualCardRequested = $attemptCard }
+    & $report 'RWLAB_COMPLETE' @{ virtualCardRequested = $attemptCard; fitRequested = $fitRequested }
 }
 catch {
     & $report 'RWLAB_ERROR' @{ category = $_.CategoryInfo.Category.ToString() }

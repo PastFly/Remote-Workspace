@@ -12,11 +12,36 @@ import time
 REPORT_FIELDS = {
     "RWLAB_DESKTOP": ("explorer", "sessionId", "windowsVersion", "windowsCaption"),
     "RWLAB_TPM": ("getTpmAvailable", "tpmPresent", "tpmReady", "tpmManufacturer", "secureBoot", "virtualCardTool"),
-    "RWLAB_CARD": ("attempted", "readerVisible", "createExitCode", "removed"),
+    "RWLAB_CARD": (
+        "attempted", "createdState", "readerVisible", "createExitCode", "destroyExitCode",
+        "removed", "newPnpCount", "pcscCountBefore", "pcscCountAfterCreate", "pcscCountAfterDestroy",
+    ),
     "RWLAB_FIT_RESULT": ("passed", "version", "scope", "growth", "candidateTested", "smartCardTested", "phase"),
-    "RWLAB_COMPLETE": ("virtualCardRequested",),
+    "RWLAB_COMPLETE": ("virtualCardRequested", "fitRequested"),
     "RWLAB_ERROR": ("category",),
 }
+
+FIT_STAGES = ("Initial", "Growth", "Shrink")
+FIT_GEOMETRY = {"viewport": 2, "stage": 2, "frame": 4}
+
+
+def read_fit_measurements(report):
+    measurements = report.get("measurements")
+    if not isinstance(measurements, dict):
+        return {}
+    result = {}
+    for stage in FIT_STAGES:
+        record = measurements.get(stage)
+        if not isinstance(record, dict):
+            continue
+        dimensions = {}
+        for field, size in FIT_GEOMETRY.items():
+            values = record.get(field)
+            if isinstance(values, list) and len(values) == size and all(type(value) is int for value in values):
+                dimensions[field] = values
+        if len(dimensions) == len(FIT_GEOMETRY):
+            result[stage] = dimensions
+    return result
 
 
 def console_state(monitor, screenshot):
@@ -62,6 +87,8 @@ def observe(serial, monitor, screenshot):
                         continue
                     kind = report["kind"]
                     details = {key: report[key] for key in REPORT_FIELDS[kind] if key in report}
+                    if kind == "RWLAB_FIT_RESULT":
+                        details["measurements"] = read_fit_measurements(report)
                     observed[kind] = details
                     print(f"{kind} {json.dumps(details, ensure_ascii=True)}", flush=True)
         if "RWLAB_ERROR" in observed:
@@ -79,10 +106,18 @@ def observe(serial, monitor, screenshot):
         raise RuntimeError("Windows did not report a present and ready TPM")
     if observed["RWLAB_COMPLETE"].get("virtualCardRequested"):
         card = observed.get("RWLAB_CARD", {})
-        if not (card.get("readerVisible") and card.get("removed")):
+        counts = tuple(card.get(key) for key in ("pcscCountBefore", "pcscCountAfterCreate", "pcscCountAfterDestroy"))
+        if (
+            card.get("readerVisible") is not True or card.get("removed") is not True
+            or card.get("createExitCode") != 0 or card.get("destroyExitCode") != 0
+            or card.get("newPnpCount") != 1 or any(type(count) is not int for count in counts)
+            or counts[1] != counts[0] + 1 or counts[2] != counts[0]
+        ):
             raise RuntimeError("Windows did not confirm both creation and removal of the disposable virtual reader")
-    if "RWLAB_FIT_RESULT" in observed and not observed["RWLAB_FIT_RESULT"].get("passed"):
-        raise RuntimeError("The separate published-build RDP fixture did not pass")
+    if observed["RWLAB_COMPLETE"].get("fitRequested") or "RWLAB_FIT_RESULT" in observed:
+        fit = observed.get("RWLAB_FIT_RESULT", {})
+        if fit.get("passed") is not True or fit.get("version") != "0.8.4.0" or len(fit["measurements"]) != len(FIT_STAGES):
+            raise RuntimeError("The published 0.8.4 RDP fixture did not pass with three measured stages")
     print("PASS Windows first logon reached the desktop and detected a ready TPM.", flush=True)
 
 
