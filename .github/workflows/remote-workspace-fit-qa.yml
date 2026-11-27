@@ -1,0 +1,114 @@
+name: Remote Workspace Windows RDP lab readiness
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-085-windows-probe-*'
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 4
+    steps:
+      - name: Check stock mstsc and the existing loopback listener
+        shell: pwsh
+        run: |
+          @'
+          [CmdletBinding()]
+          param(
+              [switch] $DisposableLab,
+              [switch] $LaunchLoopback,
+              [ValidateRange(1, 65535)]
+              [int] $Port = 3389,
+              [ValidateRange(3, 30)]
+              [int] $ObservationSeconds = 12
+          )
+          
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          
+          if ($env:OS -ne 'Windows_NT') {
+              throw 'This probe requires Windows.'
+          }
+          if ($env:GITHUB_ACTIONS -ne 'true' -and -not $DisposableLab) {
+              throw 'Run this probe on a disposable Windows test system.'
+          }
+          
+          $mstsc = Join-Path ([Environment]::SystemDirectory) 'mstsc.exe'
+          $operatingSystem = Get-CimInstance Win32_OperatingSystem
+          $terminalService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          $eventLog = 'Microsoft-Windows-TerminalServices-ClientActiveXCore/Operational'
+          $currentProcess = Get-Process -Id $PID
+          $report = [ordered] @{
+              windowsVersion = $operatingSystem.Version
+              windowsProductType = $operatingSystem.ProductType
+              sessionId = $currentProcess.SessionId
+              userInteractive = [Environment]::UserInteractive
+              mstscVersion = if (Test-Path -LiteralPath $mstsc) { (Get-Item -LiteralPath $mstsc).VersionInfo.FileVersion } else { $null }
+              terminalServiceStatus = if ($terminalService) { [string] $terminalService.Status } else { 'Missing' }
+              qemuWslCommands = @(Get-Command qemu-system-x86_64.exe, wsl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+              port = $Port
+              loopbackTcp = $false
+              mstscLaunch = 'not-requested'
+              mstscEventIds = @()
+          }
+          
+          $tcp = [System.Net.Sockets.TcpClient]::new()
+          try {
+              $attempt = $tcp.ConnectAsync([System.Net.IPAddress]::Loopback, $Port)
+              $report.loopbackTcp = $attempt.Wait(2000) -and $tcp.Connected
+          }
+          catch [System.AggregateException] {
+              if ($_.Exception.InnerException -isnot [System.Net.Sockets.SocketException]) { throw }
+          }
+          finally {
+              $tcp.Dispose()
+          }
+          
+          if ($LaunchLoopback) {
+              if (-not $report.loopbackTcp) {
+                  $report.mstscLaunch = 'listener-unreachable'
+              }
+              elseif (-not $report.mstscVersion -or -not $report.userInteractive -or $report.sessionId -eq 0) {
+                  $report.mstscLaunch = 'interactive-client-unavailable'
+              }
+              else {
+                  $scratchRoot = [System.IO.Path]::GetTempPath()
+                  $rdpFile = Join-Path $scratchRoot ('rw-lab-' + [Guid]::NewGuid() + '.rdp')
+                  $client = $null
+                  try {
+                      @(
+                          "full address:s:127.0.0.1:${Port}"
+                          'prompt for credentials:i:1'
+                          'authentication level:i:1'
+                          'enablecredsspsupport:i:1'
+                      ) | Set-Content -LiteralPath $rdpFile -Encoding Unicode
+          
+                      $startTime = Get-Date
+                      $client = Start-Process -FilePath $mstsc -ArgumentList @(('"' + $rdpFile + '"'), '/public') -PassThru
+                      Start-Sleep -Seconds $ObservationSeconds
+          
+                      $events = @(Get-WinEvent -FilterHashtable @{ LogName = $eventLog; StartTime = $startTime } -ErrorAction SilentlyContinue)
+                      $report.mstscEventIds = @(
+                          $events | Where-Object { ([xml] $_.ToXml()).Event.System.Execution.ProcessID -eq $client.Id } |
+                              Sort-Object RecordId |
+                              Select-Object -ExpandProperty Id
+                      )
+                      $report.mstscLaunch = if ($client.HasExited) { 'process-exited' } else { 'process-running' }
+                  }
+                  finally {
+                      if ($null -ne $client) {
+                          if (-not $client.HasExited) {
+                              $client.Kill()
+                              $null = $client.WaitForExit(3000)
+                          }
+                          $client.Dispose()
+                      }
+                      Remove-Item -LiteralPath $rdpFile -Force -ErrorAction SilentlyContinue
+                  }
+              }
+          }
+          
+          [pscustomobject] $report | ConvertTo-Json -Depth 3
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'Probe-RdpLab.ps1')
+          & (Join-Path $env:RUNNER_TEMP 'Probe-RdpLab.ps1') -LaunchLoopback
