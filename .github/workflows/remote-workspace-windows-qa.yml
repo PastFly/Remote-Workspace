@@ -1,0 +1,44 @@
+name: Remote Workspace Windows desktop QA
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-082-windows-dialog-retry'
+permissions:
+  contents: write
+jobs:
+  desktop:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Check the actual WPF dialog and native HWND baseline
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REPOSITORY -ne 'PastFly/Remote-Workspace') { throw 'This test needs the repository runner.' }
+          $lab = Join-Path $env:RUNNER_TEMP 'remote-workspace-qa'
+          New-Item -Path $lab -ItemType Directory | Out-Null
+          gh release download 'v0.8.1' --repo $env:GITHUB_REPOSITORY --pattern 'Remote-Workspace-0.8.1-x64.msi' --dir $lab
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download baseline.' }
+          $draft = 'qa-windows-082-20261127'
+          $isDraft = gh release view $draft --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -ne 0 -or $isDraft -ne 'true') { throw 'Expected a private Windows QA draft.' }
+          gh release download $draft --repo $env:GITHUB_REPOSITORY --pattern 'Remote-Workspace-0.8.2-x64.msi' --pattern '*Smoke.exe' --dir $lab
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download QA assets.' }
+          $env:GH_TOKEN = $null
+          function Install([string]$Version, [string]$Hash) {
+            $msi = Join-Path $lab "Remote-Workspace-$Version-x64.msi"
+            if ((Get-FileHash -LiteralPath $msi).Hash -ne $Hash) { throw "Incorrect digest for $Version" }
+            $msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+            $proc = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"'+$msi+'"'), '/qn', '/norestart') -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "Unexpected MSI exit: $($proc.ExitCode)." }
+          }
+          $app = Join-Path $env:ProgramFiles 'Remote Workspace/RemoteWorkspace.exe'
+          Install '0.8.1' '95d593ad416c1212e2cced8f64fcc62240b6dbddbd3f3b351aab2704e4b4ce47'
+          & (Join-Path $lab 'NativeViewportWin32Smoke.exe') $app --expect-uncompensated
+          $baseline = $LASTEXITCODE
+          Install '0.8.2' '9de1404f7d700120d2d83e97635a4c4d9fb85a63c065b5eaa3bc8caaab9ffe71'
+          & (Join-Path $lab 'UpdateDialogWin32Smoke.exe') $app
+          $dialog = $LASTEXITCODE
+          if ($baseline -ne 0 -or $dialog -ne 0) { throw "Windows desktop checks failed: baseline $baseline, dialog $dialog" }
