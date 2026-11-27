@@ -1,0 +1,20 @@
+name: Isolated stock MSTSC smoke
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-085-live-rdp-*'
+permissions:
+  contents: read
+jobs:
+  local-guest:
+    runs-on: windows-2022
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Test stock MSTSC against a disposable loopback guest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./qa/live-rdp/Invoke-LocalXrdpLab.ps1 -TestScript ./qa/live-rdp/Test-StockMstscLab.ps1
