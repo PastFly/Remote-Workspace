@@ -1,0 +1,45 @@
+name: Remote Workspace Win32 viewport fit QA
+on:
+  push:
+    branches:
+      - 'qa/remote-workspace-084-windows-*'
+permissions:
+  contents: write
+jobs:
+  fit:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Compare 1:1 clipping and proportional fit in installed builds
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REPOSITORY -ne 'PastFly/Remote-Workspace') { throw 'This test needs the repository runner.' }
+          $lab = Join-Path $env:RUNNER_TEMP 'remote-workspace-qa'
+          New-Item -Path $lab -ItemType Directory | Out-Null
+          gh release download 'v0.8.3' --repo $env:GITHUB_REPOSITORY --pattern 'Remote-Workspace-0.8.3-x64.msi' --dir $lab
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download baseline.' }
+          $draft = 'qa-windows-084-20261127'
+          $isDraft = gh release view $draft --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -ne 0 -or $isDraft -ne 'true') { throw 'Expected a private Windows QA draft.' }
+          gh release download $draft --repo $env:GITHUB_REPOSITORY --pattern 'Remote-Workspace-0.8.4-x64.msi' --pattern 'NativeViewportFitSmoke.exe' --dir $lab
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download QA assets.' }
+          $env:GH_TOKEN = $null
+          function Install([string]$Version, [string]$Hash) {
+            $msi = Join-Path $lab "Remote-Workspace-$Version-x64.msi"
+            if ((Get-FileHash -LiteralPath $msi).Hash -ne $Hash) { throw "Incorrect digest for $Version" }
+            $msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+            $proc = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"'+$msi+'"'), '/qn', '/norestart') -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "Unexpected MSI exit: $($proc.ExitCode)." }
+          }
+          $app = Join-Path $env:ProgramFiles 'Remote Workspace/RemoteWorkspace.exe'
+          $fixture = Join-Path $lab 'NativeViewportFitSmoke.exe'
+          if ((Get-FileHash -LiteralPath $fixture).Hash -ne 'c55bbe4aff34e77c64f29bd1128a5f5656b77ad88a1cb9cb95cef9d90e954387') { throw 'Incorrect fixture digest' }
+          Install '0.8.3' '33ecc0972be70ceb2188110d85fa518927e6e4555ded26d6a7cf8fddcd03fd25'
+          & $fixture $app --expect-083-native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Install '0.8.4' '9dcdd34168ef211cdcd09fe0bbd1407ea3ce1b226b7fe0c6c0f3525898051fd8'
+          & $fixture $app
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
